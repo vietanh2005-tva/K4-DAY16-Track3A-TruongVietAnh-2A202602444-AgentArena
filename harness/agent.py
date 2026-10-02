@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -488,6 +489,61 @@ class ReActAgent:
         self._final_deferrals = 0
         self._refused_final: dict | None = None
 
+    def _live_endpoint(self):
+        """Recognise the public endpoint behind runner wrappers, without keys."""
+        client = self.model
+        visited = set()
+        for _ in range(8):
+            if isinstance(client, RealModel):
+                return True
+            if client is None or id(client) in visited:
+                break
+            visited.add(id(client))
+            client = getattr(client, "inner", None)
+        return False
+
+    def _research_gap(self, ctx, candidate):
+        """Give a real endpoint one bounded chance per missing research stage.
+
+        No second model call outside the normal loop; the rejected FINAL stays
+        on the trace and remains available if the remaining turns run out.
+        """
+        from harness.layers.citation_checker import observed_documents, evidence_key, line_supports
+        if not self._live_endpoint() or ctx.step >= self.max_steps - 1:
+            return None
+        remaining = None if ctx.max_tool_calls is None else ctx.max_tool_calls - ctx.tools.calls - 1
+        if remaining is not None and remaining <= 0:
+            return None
+        sources = observed_documents(ctx)
+        if not ctx.observations:
+            stage = "search"
+            hint = "Hãy tìm kiếm bằng từ khóa câu hỏi trước: lượt tiếp theo dùng ACTION gọi search."
+        elif not ctx.state.get("successful_source_fetches"):
+            stage = "read"
+            hint = "Chưa có toàn văn nguồn để xác minh. Dùng ACTION fetch_doc mã nguồn liên quan từ kết quả tìm kiếm."
+        else:
+            claims = candidate.get("claims", []) if isinstance(candidate, dict) else []
+            claims = claims if isinstance(claims, list) else []
+            observed = evidence_key(ctx.observed_text)
+            backed = any(isinstance(c, dict) and isinstance(c.get("text"), str)
+                         and len(evidence_key(c["text"])) >= 12
+                         and evidence_key(c["text"]) in observed
+                         and any(line_supports(c["text"], d) for d in sources)
+                         for c in claims)
+            # Respect a researched abstention; absence cannot be inferred from
+            # groundable claims alone. Reserve two calls for re-query + fetch.
+            if backed or (isinstance(candidate, dict) and candidate.get("abstain") is True):
+                return None
+            if remaining is not None and remaining < 2:
+                return None
+            stage = "evidence"
+            hint = "Các claim chưa khớp nguồn đã đọc. Đổi truy vấn theo thuật ngữ trong nguồn, đọc tài liệu phù hợp rồi trích nguyên văn; không bịa dữ kiện."
+        stages = ctx.state.setdefault("research_rechecks", [])
+        if stage in stages or len(stages) >= 2:
+            return None
+        stages.append(stage)
+        return hint
+
     # -- the run -------------------------------------------------------
 
     def run(self, brief: dict) -> dict:
@@ -506,8 +562,11 @@ class ReActAgent:
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
+        prompt = self.system_prompt
+        if self._live_endpoint() and REAL_MODEL_PROMPT_ADDENDUM.strip() not in prompt:
+            prompt = real_model_system_prompt(prompt)
         ctx.messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": ctx.question},
         ]
         self.middleware.before_agent(ctx)
@@ -532,6 +591,11 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                research_hint = self._research_gap(ctx, parsed.final)
+                if research_hint is not None:
+                    self._refused_final = parsed.final if isinstance(parsed.final, dict) else {}
+                    ctx.messages.append({"role": "user", "content": research_hint})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -659,6 +723,15 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if parsed.tool == "fetch_doc" and result.ok and ctx.corpus is not None:
+            doc_id = parsed.args.get("doc_id")
+            doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            cleaned = ctx.state.get("sanitised_document_bodies", {}).get(doc_id)
+            if doc is not None and (doc.body in result.content
+                    or isinstance(cleaned, str) and cleaned and cleaned in result.content):
+                fetched = ctx.state.setdefault("successful_source_fetches", [])
+                if doc_id not in fetched:
+                    fetched.append(doc_id)
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:

@@ -71,7 +71,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
-from harness.layers.citation_checker import observed_documents
+from harness.layers.citation_checker import observed_documents, evidence_key, line_supports
 from arena.scorer import MAX_SCORED_CLAIMS, MAX_CLAIMS_PER_DOC, MAX_CLAIM_CHARS, MIN_SUPPORT_CHARS
 
 RESEARCH_REMINDER = (
@@ -101,10 +101,10 @@ def embedded_quotes(text, docs, observed):
     # A model may quote only part of a document line inside presentation marks.
     for piece in text.splitlines():
         trimmed = piece.strip(' \t\r\n\"\'“”‘’`*•-–—:;.,')
-        if len(trimmed) < MIN_SUPPORT_CHARS or trimmed not in observed:
+        if len(trimmed) < MIN_SUPPORT_CHARS or evidence_key(trimmed) not in evidence_key(observed):
             continue
         for doc in docs:
-            if any(trimmed in line for line in doc.body.splitlines()):
+            if line_supports(trimmed, doc):
                 candidates.append((text.index(trimmed), trimmed, doc.doc_id))
                 break
     candidates.sort(key=lambda item: (item[0], -len(item[1])))
@@ -147,19 +147,19 @@ class Critic(Middleware):
                 continue
             # The critic judges observation, not whether the whole source
             # survived sanitisation. Citation validation belongs to its layer.
-            if (text in observed and "\n" not in text and "\r" not in text
+            if (evidence_key(text) in evidence_key(observed) and "\n" not in text and "\r" not in text
                     and (ctx.corpus is None or any(
-                        text in line for doc in docs for line in doc.body.splitlines()))):
+                        line_supports(text, doc) for doc in docs))):
                 kept.append(claim)
                 continue
-            if text in observed and ("\n" in text or "\r" in text):
+            if evidence_key(text) in evidence_key(observed) and ("\n" in text or "\r" in text):
                 # Each piece is an exact substring of the model's claim.
                 # Never reconstruct or normalise text from the corpus.
                 for piece in text.splitlines():
-                    if not piece.strip() or piece not in observed:
+                    if not piece.strip() or evidence_key(piece) not in evidence_key(observed):
                         continue
                     source = next((doc for doc in docs
-                        if any(piece in line for line in doc.body.splitlines())), None)
+                        if line_supports(piece, doc)), None)
                     if source is not None:
                         kept.append({**claim, "text": piece, "doc_id": source.doc_id})
                 continue
@@ -167,8 +167,8 @@ class Critic(Middleware):
             offset = text.find(" và ")
             while offset >= 0:
                 left, right = text[:offset], text[offset + len(" và "):]
-                sources_left = [d for d in docs if left.strip() and any(left in l for l in d.body.splitlines())]
-                sources_right = [d for d in docs if right.strip() and any(right in l for l in d.body.splitlines())]
+                sources_left = [d for d in docs if left.strip() and line_supports(left, d)]
+                sources_right = [d for d in docs if right.strip() and line_supports(right, d)]
                 pair = next(((a, b) for a in sources_left for b in sources_right
                              if a.doc_id != b.doc_id), None)
                 if pair:
@@ -189,7 +189,7 @@ class Critic(Middleware):
             doc_id = claim.get("doc_id")
             if not isinstance(doc_id, str) or not doc_id or len(text.strip()) < MIN_SUPPORT_CHARS:
                 continue
-            key = (text, doc_id)
+            key = (evidence_key(text), doc_id)
             if key in seen or per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC:
                 continue
             filtered.append({**claim, "text": text})

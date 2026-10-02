@@ -59,7 +59,19 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import unicodedata
+
 from harness.middleware import Middleware
+
+
+def evidence_key(text):
+    """Scorer-compatible matching key; never written into a submitted claim."""
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def line_supports(text, doc):
+    key = evidence_key(text)
+    return bool(key) and any(key in evidence_key(line) for line in doc.body.splitlines())
 
 
 def observed_documents(ctx):
@@ -94,10 +106,10 @@ class CitationChecker(Middleware):
             doc_id = claim.get("doc_id")
             doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
             if (doc is not None and doc in sources
-                    and any(text in line for line in doc.body.splitlines())):
+                    and line_supports(text, doc)):
                 continue
             for source in sources:
-                if any(text in line for line in source.body.splitlines()):
+                if line_supports(text, source):
                     claim["doc_id"] = source.doc_id
                     break
         report["citations"] = sorted({c["doc_id"] for c in claims
