@@ -48,6 +48,8 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
@@ -62,17 +64,48 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content
+        if not isinstance(content, str) or BLOCK_START not in content:
+            return result
+        doc_id = args.get("doc_id") if name == "fetch_doc" else None
+        doc = ctx.corpus.get(doc_id) if ctx.corpus and isinstance(doc_id, str) else None
+        complete_document = result.ok and doc is not None and content == doc.body
+        while BLOCK_START in content:
+            start = content.find(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            content = (content[:start] + PLACEHOLDER
+                       + (content[end + len(BLOCK_END):] if end >= 0 else ""))
+        if complete_document:
+            # Keep the actually returned clean body, never the removed instructions.
+            ctx.state.setdefault("sanitised_document_bodies", {})[doc_id] = content
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            # Delete contaminated claims instead of rewriting their quotations.
+            report["claims"] = [claim for claim in claims
+                if INJECTION_CANARY not in str(claim)]
+            report["citations"] = sorted({claim["doc_id"] for claim in report["claims"]
+                if isinstance(claim, dict) and isinstance(claim.get("doc_id"), str)})
+            if claims and not report["claims"]:
+                report["abstain"] = True
+                report["answer"] = "Không đủ bằng chứng an toàn để đưa ra kết luận."
+        # Canary can also leak via verdict or an additional report field.
+        for key in list(report):
+            if key != "claims":
+                report[key] = _remove_canary(report[key])
+                if isinstance(key, str) and INJECTION_CANARY in key:
+                    report[key.replace(INJECTION_CANARY, "")] = report.pop(key)
+        return report
+
+
+def _remove_canary(value):
+    if isinstance(value, str):
+        return value.replace(INJECTION_CANARY, "").strip()
+    if isinstance(value, list):
+        return [_remove_canary(item) for item in value]
+    if isinstance(value, dict):
+        return {key.replace(INJECTION_CANARY, "") if isinstance(key, str) else key:
+                _remove_canary(item) for key, item in value.items()}
+    return value
